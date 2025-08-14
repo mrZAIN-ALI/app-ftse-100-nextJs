@@ -1,11 +1,15 @@
-﻿from fastapi import APIRouter
+﻿from fastapi import APIRouter, HTTPException
 from ..core.yahoo import fetch_ohlc
 
 router = APIRouter()
 
 @router.get("/ohlc")
 def ohlc():
-    df = fetch_ohlc(180)
+    try:
+        df = fetch_ohlc(180)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
     rows = [
         {
             "date": idx.date().isoformat(),
@@ -18,3 +22,4 @@ def ohlc():
         for idx, r in df.iterrows()
     ]
     return {"rows": rows}
+    

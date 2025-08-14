@@ -1,36 +1,47 @@
-﻿from pathlib import Path
-import numpy as np
+﻿import os
 import joblib
+import numpy as np
 from tensorflow.keras.models import load_model
 
-ROOT = Path(__file__).resolve().parents[1]
-MODEL_PATH = ROOT / "models" / "best_lstm_model.h5"
-SCALER_PATH = ROOT / "models" / "scaler.save"
+# Default paths (in case no args passed)
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # backend/app
+DEFAULT_MODEL_PATH = os.path.join(BASE_DIR, "models", "best_lstm_model.h5")
+DEFAULT_SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.save")
 
-_model = None
-_scaler = None
-
-def get_scaler():
-    global _scaler
-    if _scaler is None:
-        _scaler = joblib.load(SCALER_PATH)
-    return _scaler
-
-def get_model():
-    global _model
-    if _model is None:
-        _model = load_model(str(MODEL_PATH), compile=False)
-    return _model
-
-def predict_next_close(last60_rows):
+def predict_next_close(last60: np.ndarray, model_path: str = None, scaler_path: str = None) -> float:
     """
-    last60_rows: np.array shape [60,5] ordered as [Close,High,Low,Open,Volume]
-    returns float predicted_close
+    Predict the next closing price given last 60 rows of features.
+    
+    Args:
+        last60 (np.ndarray): Shape (60, 5) → [Close, High, Low, Open, Volume]
+        model_path (str): Optional path to Keras model.
+        scaler_path (str): Optional path to saved scaler.
+
+    Returns:
+        float: Predicted close price
     """
-    scaler = get_scaler()
-    X_scaled = scaler.transform(last60_rows)
-    X = np.expand_dims(X_scaled, axis=0)  # [1,60,5]
-    y_scaled = get_model().predict(X, verbose=0)  # [1,1]
-    dummy = np.zeros((1, last60_rows.shape[1]))
-    dummy[0,0] = y_scaled[0,0]  # inverse only Close
-    return float(scaler.inverse_transform(dummy)[0][0])
+    if model_path is None:
+        model_path = DEFAULT_MODEL_PATH
+    if scaler_path is None:
+        scaler_path = DEFAULT_SCALER_PATH
+
+    # Load model and scaler
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    if not os.path.exists(scaler_path):
+        raise FileNotFoundError(f"Scaler file not found: {scaler_path}")
+
+    model = load_model(model_path, compile=False)
+    scaler = joblib.load(scaler_path)
+
+    # Scale input
+    scaled_input = scaler.transform(last60)
+    X_input = np.expand_dims(scaled_input, axis=0)  # Shape: (1, 60, 5)
+
+    # Predict
+    pred_scaled = model.predict(X_input)
+    pred_close = scaler.inverse_transform(
+        np.hstack([pred_scaled, np.zeros((pred_scaled.shape[0], last60.shape[1] - 1))])
+    )[0, 0]
+
+    return float(pred_close)

@@ -1,22 +1,20 @@
-﻿import "./globals.css"
-import Providers from "./providers"
-import AppTopBar from "./components/AppTopBar"
-import { CssBaseline, ThemeProvider } from "@mui/material"
-import theme from "@/lib/theme"
+﻿import './globals.css'
+import Providers from './providers'
+import AppTopBar from './components/AppTopBar'
+import ThemeRegistry from './ThemeRegistry'
 
-export const metadata = { title: "FTSE100 Forecast" }
+export const metadata = { title: 'FTSE100 Forecast' }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <body>
-        <ThemeProvider theme={theme}>
-          <CssBaseline />
+        <ThemeRegistry>
           <Providers>
             <AppTopBar />
             {children}
           </Providers>
-        </ThemeProvider>
+        </ThemeRegistry>
       </body>
     </html>
   )
