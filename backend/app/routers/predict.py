@@ -7,7 +7,7 @@ from ..core.yahoo import fetch_ohlc
 from ..core.model import predict_next_close
 from ..core import supa
 
-# ✅ Correct paths to your models folder
+# ✅ Paths to models
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # backend/app
 MODEL_PATH = os.path.join(BASE_DIR, "models", "best_lstm_model.h5")
 SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.save")
@@ -30,7 +30,6 @@ class PredictOut(BaseModel):
     scaler_version: str = "minmax_v1"
     ticker_used: str | None = None
 
-
 @router.get("/predict", response_model=PredictOut)
 def predict():
     # 1) Fetch market data
@@ -42,7 +41,6 @@ def predict():
 
     if df is None or df.empty:
         raise HTTPException(status_code=502, detail="No market data returned.")
-
     if len(df) < 60:
         raise HTTPException(status_code=400, detail="Not enough data for prediction (need >= 60 rows).")
 
@@ -68,7 +66,7 @@ def predict():
     conf_ok = pred_close >= band_upper if direction == "UP" else pred_close <= band_lower
     signal = "LONG" if (direction == "UP" and conf_ok) else ("SHORT" if (direction == "DOWN" and conf_ok) else "NO_TRADE")
 
-    # 5) Save to Supabase
+    # 5) Save to Supabase — fail if cannot save
     try:
         record = supa.insert_prediction({
             "window_start": window_start,
@@ -84,11 +82,12 @@ def predict():
             "scaler_version": "minmax_v1",
             "raw_context": {"ticker_used": ticker_used}
         })
+        if not record or "id" not in record:
+            raise RuntimeError("Supabase insert returned no ID")
         rec_id = record.get("id")
         gen_at = record.get("generated_at")
     except Exception as e:
-        print(f"[WARN] Failed to save prediction: {e}")
-        rec_id, gen_at = None, None
+        raise HTTPException(status_code=500, detail=f"Failed to save prediction to database: {e}")
 
     return PredictOut(
         id=rec_id,
