@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import asyncio
 
-from .routers import health, ohlc, predict, history, reconcile
+from .routers import health, ohlc, predict, history, reconcile, backtest
 from .core import supa
 
 load_dotenv()  # normal load
@@ -25,7 +25,7 @@ app.include_router(ohlc.router)
 app.include_router(predict.router)
 app.include_router(history.router)
 app.include_router(reconcile.router)
-
+app.include_router(backtest.router)
 # ===== DB Connectivity Check After Startup =====
 @app.on_event("startup")
 async def startup_event():

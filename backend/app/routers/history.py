@@ -1,8 +1,79 @@
-﻿from fastapi import APIRouter
+﻿# backend/app/routers/history.py
+from datetime import date
+from typing import Optional
+import io, csv, requests
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
 from ..core import supa
 
-router = APIRouter()
+router = APIRouter(tags=["history"])
 
-@router.get("/predictions")
-def predictions():
-    return {"rows": supa.list_predictions(500)}
+def _check_conn():
+    if not supa.SUPABASE_URL or not supa.SUPABASE_KEY or not supa.REST:
+        raise HTTPException(status_code=503, detail="Supabase credentials missing")
+    return f"{supa.REST}/{supa.TABLE}", supa.HEADERS
+
+@router.get("/history")
+def list_history(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    by: str = "generated_at",          # or "prediction_for"
+    desc: bool = True,
+    format: str = "json",              # "json" | "csv"
+):
+    base, headers = _check_conn()
+
+    # Validate sortable/filterable column
+    col = by if by in ("generated_at", "prediction_for") else "generated_at"
+    order = f"{col}.{'desc' if desc else 'asc'}"
+
+    # Build PostgREST query
+    url = f"{base}?select=*&order={order}&limit={limit}&offset={offset}"
+    if start:
+        url += f"&{col}=gte.{start.isoformat()}"
+    if end:
+        url += f"&{col}=lte.{end.isoformat()}"
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        rows = r.json() or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {getattr(e, 'response', None) and getattr(e.response, 'text', '') or str(e)}")
+
+    if format.lower() == "csv":
+        buf = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        else:
+            writer = csv.writer(buf); writer.writerow(["no","records"])
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=predictions.csv"},
+        )
+
+    return {"success": True, "count": len(rows), "offset": offset, "limit": limit, "data": rows}
+
+@router.get("/history/{prediction_id}")
+def get_history_item(prediction_id: str):
+    base, headers = _check_conn()
+    url = f"{base}?select=*&id=eq.{prediction_id}"
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json() or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {getattr(e, 'response', None) and getattr(e.response, 'text', '') or str(e)}")
+
+    if not data:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"success": True, "data": data[0]}

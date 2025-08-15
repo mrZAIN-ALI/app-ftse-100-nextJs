@@ -69,3 +69,11 @@ def connection_status():
         return False, f"HTTP {r.status_code} - {r.text}"
     except Exception as e:
         return False, str(e)
+# app/core/supa.py
+
+def is_connected() -> bool:
+    """
+    Check if Supabase connection is available.
+    Returns True if URL and key are loaded.
+    """
+    return bool(SUPABASE_URL and SUPABASE_KEY)
