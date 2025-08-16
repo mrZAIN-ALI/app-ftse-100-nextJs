@@ -1,215 +1,471 @@
 # backend/app/routers/backtest.py
-from datetime import date
-from typing import Optional, List, Dict, Any
-import requests
-import math
+from datetime import date, timedelta
+from functools import lru_cache
+from typing import Any, Dict, List, Optional
 
+import os
+import numpy as np
+import pandas as pd
+import yfinance as yf
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+from pathlib import Path
+import joblib
+from tensorflow.keras.models import load_model
 
-from ..core import supa
+router = APIRouter(prefix="/backtest", tags=["backtest"])
 
-router = APIRouter(tags=["backtest"])
+# ===== Config =====
+DEFAULT_TICKER = "^FTSE"
+DEFAULT_LOOKBACK = int(os.getenv("LOOKBACK", "60"))
+ENV_MODEL_PATH = os.getenv("MODEL_PATH", "")
+ENV_SCALER_PATH = os.getenv("SCALER_PATH", "")
+FEATURES = ["Close", "High", "Low", "Open", "Volume"]
 
-def _check_conn():
-    if not (supa.SUPABASE_URL and supa.SUPABASE_KEY and supa.REST):
-        raise HTTPException(status_code=503, detail="Supabase credentials missing")
-    return f"{supa.REST}/{supa.TABLE}", supa.HEADERS
+# ===== Path resolver =====
+def _resolve_file(preferred: str, default_name: str) -> str:
+    """
+    Find file across sensible locations. Returns absolute path or raises FileNotFoundError.
+    """
+    here = Path(__file__).resolve()                 # .../app/routers/backtest.py
+    app_dir = here.parent.parent                    # .../app
+    project_root = app_dir.parent                   # .../backend
+    cwd = Path.cwd()
+    candidates: List[Path] = []
 
-def _safe_float(x):
-    try:
-        if x is None: return None
-        return float(x)
-    except Exception:
-        return None
+    if preferred:
+        p = Path(preferred)
+        candidates += [p, cwd / p, project_root / p, app_dir / p]
 
-@router.get("/backtest")
-def backtest(
-    start: Optional[date] = None,
-    end: Optional[date] = None,
-    window: int = Query(7, ge=2, le=60),          # rolling stats window
-    cost: float = Query(0.0, ge=0.0, le=0.01),    # per-side cost (e.g., 0.001 = 0.10%)
+    candidates += [
+        cwd / default_name,
+        project_root / default_name,
+        app_dir / default_name,
+        app_dir / "models" / default_name,          # <-- your files live here
+        here.parent / default_name,
+        Path("/mnt/data") / default_name,
+    ]
+
+    tried = []
+    for c in candidates:
+        c = c.resolve()
+        tried.append(str(c))
+        if c.exists():
+            print(f"[model-path] Using: {c}")
+            return str(c)
+
+    raise FileNotFoundError(
+        f"File '{default_name}' not found. Tried:\n" + "\n".join(tried)
+    )
+
+# ===== Cached loaders =====
+@lru_cache(maxsize=1)
+def _load_scaler():
+    path = _resolve_file(ENV_SCALER_PATH, "scaler.save")
+    return joblib.load(path)
+
+@lru_cache(maxsize=1)
+def _load_model():
+    path = _resolve_file(ENV_MODEL_PATH, "best_lstm_model.h5")
+    return load_model(path, compile=False)  # inference only
+
+# ===== Helpers =====
+def _dl_ohlc(ticker: str, start_dt: date, end_dt: date) -> pd.DataFrame:
+    # pad backwards for lookback and a bit forward for safety
+    ystart = (start_dt - timedelta(days=220)).strftime("%Y-%m-%d")
+    yend = (end_dt + timedelta(days=5)).strftime("%Y-%m-%d")
+    df = yf.download(ticker, start=ystart, end=yend, auto_adjust=False, progress=False)
+    if df.empty:
+        raise HTTPException(400, "No data returned from Yahoo Finance.")
+    df = df[FEATURES].dropna().copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df.sort_index(inplace=True)
+    return df
+
+def _predict_window(model, scaler, window_df: pd.DataFrame) -> float:
+    X = scaler.transform(window_df.values)             # (lookback, 5)
+    X = X.reshape(1, X.shape[0], X.shape[1])           # (1, lookback, 5)
+    scaled_pred = float(model.predict(X, verbose=0).reshape(-1)[0])
+    dummy = np.zeros((1, len(FEATURES)))
+    dummy[0, 0] = scaled_pred                          # Close is index 0
+    inv = scaler.inverse_transform(dummy)
+    return float(inv[0, 0])
+
+def _direction(prev_close: float, value: float) -> int:
+    s = np.sign(value - prev_close)
+    return int(s) if s in (-1, 0, 1) else 0
+
+def _first_valid_target(df: pd.DataFrame, want: date, lookback: int) -> Optional[pd.Timestamp]:
+    for t in df.index:
+        if t.date() < want:
+            continue
+        idx = df.index.get_indexer([t])[0]
+        if idx >= lookback:
+            return t
+    return None
+
+def _fmt(ts: pd.Timestamp) -> str:
+    return ts.strftime("%Y-%m-%d")
+
+# ===== Schemas =====
+class PointResponse(BaseModel):
+    success: bool
+    target_date: str
+    lookback: int
+    last_close: float
+    predicted_close: float
+    actual_close: float
+    direction_pred: str
+    direction_hit: bool
+    abs_error: float
+    pct_error: float
+    accuracy_pct: float
+    trade_points: float
+    trade_return_pct: float
+
+class BacktestSeries(BaseModel):
+    dates: List[str]
+    cum_pl_points: List[Optional[float]]
+    cum_return_pct: List[Optional[float]]
+    rolling_directional_accuracy_pct: List[Optional[float]]
+    rolling_rmse: List[Optional[float]]
+
+class BacktestResponse(BaseModel):
+    success: bool
+    summary: Dict[str, Any]
+    series: BacktestSeries
+    table: List[Dict[str, Any]]
+
+# ===== Single day (auto-roll forward; no 404 for holidays/insufficient history) =====
+@router.get("/point", response_model=PointResponse)
+def backtest_point(
+    target: date = Query(..., description="Requested date; rolls to next valid trading day if needed"),
+    lookback: int = Query(DEFAULT_LOOKBACK, ge=20, le=120),
 ):
-    """
-    Backtest using predictions table:
-    - Uses LAST_CLOSE (entry) -> ACTUAL_CLOSE (exit) on prediction_for date
-    - Executes only when signal is LONG or SHORT
-    - P/L in points and return % with 2*cost slippage (entry+exit)
-    - Rolling directional accuracy & RMSE over `window`
-    """
-    base, headers = _check_conn()
+    try:
+        model = _load_model()
+        scaler = _load_scaler()
+    except FileNotFoundError as e:
+        raise HTTPException(500, str(e))
 
-    # Pull rows with actuals present, ordered by prediction_for asc
-    url = f"{base}?select=*&prediction_for=not.is.null&actual_close=not.is.null&order=prediction_for.asc"
-    if start:
-        url += f"&prediction_for=gte.{start.isoformat()}"
-    if end:
-        url += f"&prediction_for=lte.{end.isoformat()}"
+    df = _dl_ohlc(DEFAULT_TICKER, target, target)
+    t = _first_valid_target(df, target, lookback)
+    if t is None:
+        # extend 2 weeks forward to find the next trading day with enough history
+        df = _dl_ohlc(DEFAULT_TICKER, target, target + timedelta(days=14))
+        t = _first_valid_target(df, target, lookback)
+        if t is None:
+            raise HTTPException(400, "No valid trading day with enough history near the selected date.")
+
+    idx = df.index.get_indexer([t])[0]
+    window_df = df.iloc[idx - lookback: idx]
+    prev_close = float(window_df["Close"].iloc[-1])
+    actual = float(df.loc[t, "Close"])
+    pred = _predict_window(model, scaler, window_df[FEATURES])
+
+    abs_err = abs(pred - actual)
+    pct_err = (abs_err / abs(actual) * 100.0) if actual != 0 else 0.0
+    acc_pct = 100.0 - pct_err
+    dir_pred = "UP" if pred >= prev_close else "DOWN"
+    hit = (_direction(prev_close, actual) == _direction(prev_close, pred))
+
+    trade_pts = _direction(prev_close, pred) * (actual - prev_close)
+    trade_ret = (trade_pts / prev_close) * 100.0 if prev_close != 0 else 0.0
+
+    return PointResponse(
+        success=True,
+        target_date=_fmt(t),
+        lookback=lookback,
+        last_close=round(prev_close, 4),
+        predicted_close=round(pred, 4),
+        actual_close=round(actual, 4),
+        direction_pred=dir_pred,
+        direction_hit=bool(hit),
+        abs_error=round(abs_err, 4),
+        pct_error=round(pct_err, 4),
+        accuracy_pct=round(acc_pct, 4),
+        trade_points=round(trade_pts, 4),
+        trade_return_pct=round(trade_ret, 4),
+    )
+
+# ===== Range (adhoc only; single Accuracy% = 100 − MAPE%) =====
+@router.get("", response_model=BacktestResponse)
+def backtest_range(
+    start: Optional[date] = Query(None),
+    end: Optional[date] = Query(None),
+    lookback: int = Query(DEFAULT_LOOKBACK, ge=20, le=120),
+    window: int = Query(7, ge=2, le=60),
+):
+    if end is None:
+        end = date.today()
+    if start is None:
+        start = end - timedelta(days=14)
+    if start > end:
+        raise HTTPException(400, "start cannot be after end")
 
     try:
-        r = requests.get(url, headers=headers, timeout=30)
-        r.raise_for_status()
-        rows: List[Dict[str, Any]] = r.json() or []
-    except Exception as e:
-        msg = getattr(e, "response", None)
-        raise HTTPException(status_code=502, detail=f"Supabase error: {getattr(msg, 'text', str(e))}")
+        model = _load_model()
+        scaler = _load_scaler()
+    except FileNotFoundError as e:
+        raise HTTPException(500, str(e))
 
-    if not rows:
-        return {"success": True, "summary": {"count": 0}, "series": {}, "table": []}
+    raw = _dl_ohlc(DEFAULT_TICKER, start, end)
+    end = min(end, raw.index.max().date())
 
-    # Compute metrics
-    dates, lasts, preds, acts, sides = [], [], [], [], []
-    dir_hits, abs_errs, pct_errs = [], [], []
+    mask = (raw.index.date >= start) & (raw.index.date <= end)
+    tdates = list(raw.index[mask])
+    rows: List[Dict[str, Any]] = []
+    if not tdates:
+        raise HTTPException(400, "No trading days found in selected range.")
 
-    # Derived arrays
-    trade_points, trade_ret = [], []    # per row
-    cum_points, cum_ret = [], []
+    for t in tdates:
+        idx = raw.index.get_indexer([t])[0]
+        if idx < lookback:
+            continue
+        win = raw.iloc[idx - lookback: idx]
+        prev_close = float(win["Close"].iloc[-1])
+        actual = float(raw.loc[t, "Close"])
+        try:
+            pred = _predict_window(model, scaler, win[FEATURES])
+        except Exception:
+            continue
 
-    # Helper: map signal -> side
-    def map_side(sig: Optional[str]) -> int:
-        if sig == "LONG": return 1
-        if sig == "SHORT": return -1
-        return 0
+        error = pred - actual
+        abs_err = abs(error)
+        mape = (abs_err / abs(actual) * 100.0) if actual != 0 else 0.0
+        acc = 100.0 - mape
+        hit = (_direction(prev_close, actual) == _direction(prev_close, pred))
 
-    cp_sum = 0.0
-    cr_sum = 0.0
+        trade_pts = _direction(prev_close, pred) * (actual - prev_close)
+        trade_ret = (trade_pts / prev_close) * 100.0 if prev_close != 0 else 0.0
 
-    for row in rows:
-        pf = row.get("prediction_for")
-        dates.append(pf)
-
-        last_close = _safe_float(row.get("last_close"))
-        pred_close = _safe_float(row.get("predicted_close"))
-        act_close  = _safe_float(row.get("actual_close"))
-
-        lasts.append(last_close)
-        preds.append(pred_close)
-        acts.append(act_close)
-
-        # direction hit
-        hit = None
-        if last_close is not None and act_close is not None and pred_close is not None:
-            up_down_pred = 1 if pred_close >= last_close else -1
-            up_down_real = 1 if act_close >= last_close else -1
-            hit = (up_down_pred == up_down_real)
-        dir_hits.append(hit)
-
-        # errors
-        if pred_close is not None and act_close is not None:
-            err = (pred_close - act_close)
-            abs_errs.append(abs(err))
-            pct_errs.append(abs(err) / act_close if act_close else None)
-        else:
-            abs_errs.append(None)
-            pct_errs.append(None)
-
-        # side & P/L
-        side = map_side(row.get("signal"))
-        sides.append(side)
-
-        if side == 0 or last_close is None or act_close is None:
-            points = 0.0
-            ret = 0.0
-        else:
-            diff = act_close - last_close
-            gross_ret = side * (diff / last_close)           # return %
-            net_ret = gross_ret - (2.0 * cost)               # entry+exit costs
-            # points net, approximate costs in points on both sides:
-            net_points = side * diff - (last_close * cost + act_close * cost)
-            points = net_points
-            ret = net_ret
-
-        trade_points.append(points)
-        trade_ret.append(ret)
-
-        cp_sum += points
-        cr_sum += ret
-        cum_points.append(cp_sum)
-        cum_ret.append(cr_sum)
-
-    # Rolling stats
-    def rolling(arr, w, f):
-        out = []
-        for i in range(len(arr)):
-            lo = max(0, i - w + 1)
-            window_vals = [x for x in arr[lo:i+1] if x is not None]
-            out.append(f(window_vals) if window_vals else None)
-        return out
-
-    # Rolling directional accuracy (%)
-    hits_num = [1 if h is True else (0 if h is False else None) for h in dir_hits]
-    def mean(arr): 
-        valid = [x for x in arr if x is not None]
-        return (sum(valid) / len(valid)) if valid else None
-    roll_acc = rolling(hits_num, window, mean)
-    roll_acc = [round(x * 100.0, 2) if x is not None else None for x in roll_acc]
-
-    # Rolling RMSE
-    sq_errs = [( (preds[i]-acts[i])**2 ) if (preds[i] is not None and acts[i] is not None) else None
-               for i in range(len(rows))]
-    def rmse(vals):
-        v = [x for x in vals if x is not None]
-        return math.sqrt(sum(v)/len(v)) if v else None
-    roll_rmse = rolling(sq_errs, window, rmse)
-    roll_rmse = [round(x, 4) if x is not None else None for x in roll_rmse]
-
-    # Summary metrics
-    def safe_mean(vals):
-        v = [x for x in vals if x is not None]
-        return sum(v)/len(v) if v else None
-
-    mae = safe_mean([abs(preds[i]-acts[i]) if preds[i] is not None and acts[i] is not None else None for i in range(len(rows))])
-    rmse_all = rmse([sq_errs[i] for i in range(len(rows))])
-
-    # MAPE
-    mape = safe_mean([abs((preds[i]-acts[i])/acts[i]) if (preds[i] is not None and acts[i] not in (None, 0)) else None
-                      for i in range(len(rows))])
-    # Directional accuracy
-    da = safe_mean(hits_num)
-    da = da * 100.0 if da is not None else None
-
-    # Naive baseline (predict = last_close)
-    naive_abs = [abs(lasts[i]-acts[i]) if (lasts[i] is not None and acts[i] is not None) else None for i in range(len(rows))]
-    naive_sq  = [((lasts[i]-acts[i])**2) if (lasts[i] is not None and acts[i] is not None) else None for i in range(len(rows))]
-    naive_mae = safe_mean(naive_abs)
-    naive_rmse = rmse(naive_sq)
-
-    summary = {
-        "count": len(rows),
-        "executed_trades": sum(1 for s in sides if s != 0),
-        "MAE": round(mae, 4) if mae is not None else None,
-        "RMSE": round(rmse_all, 4) if rmse_all is not None else None,
-        "MAPE_pct": round(mape*100.0, 2) if mape is not None else None,
-        "Directional_Accuracy_pct": round(da, 2) if da is not None else None,
-        "Naive_MAE": round(naive_mae, 4) if naive_mae is not None else None,
-        "Naive_RMSE": round(naive_rmse, 4) if naive_rmse is not None else None,
-        "Per_Side_Cost": cost,
-        "Window": window,
-    }
-
-    series = {
-        "dates": dates,
-        "cum_pl_points": [round(x, 4) for x in cum_points],
-        "cum_return_pct": [round(x*100.0, 3) for x in cum_ret],
-        "rolling_directional_accuracy_pct": roll_acc,
-        "rolling_rmse": roll_rmse,
-    }
-
-    # Optional: include per-row computed values (short table)
-    table = []
-    for i in range(len(rows)):
-        table.append({
-            "prediction_for": dates[i],
-            "last_close": lasts[i],
-            "predicted_close": preds[i],
-            "actual_close": acts[i],
-            "signal": rows[i].get("signal"),
-            "direction_hit": dir_hits[i],
-            "abs_error": abs_errs[i],
-            "pct_error": pct_errs[i],
-            "trade_points": round(trade_points[i], 4),
-            "trade_return_pct": round(trade_ret[i]*100.0, 3),
-            "cum_pl_points": round(cum_points[i], 4),
-            "cum_return_pct": round(cum_ret[i]*100.0, 3),
+        rows.append({
+            "date": _fmt(t),
+            "actual": round(actual, 4),
+            "pred": round(pred, 4),
+            "prev_close": round(prev_close, 4),
+            "error": round(error, 4),
+            "abs_error": round(abs_err, 4),
+            "mape_pct": round(mape, 4),
+            "accuracy_pct": round(acc, 4),
+            "direction_pred": "UP" if pred >= prev_close else "DOWN",
+            "hit": bool(hit),
+            "trade_points": round(trade_pts, 4),
+            "trade_return_pct": round(trade_ret, 4),
         })
 
-    return {"success": True, "summary": summary, "series": series, "table": table}
+    if not rows:
+        raise HTTPException(400, "Not enough history for selected range.")
+
+    df = pd.DataFrame(rows)
+
+    # cumulative series (simple sum; UI only needs shape)
+    df["cum_pl_points"] = df["trade_points"].cumsum()
+    df["cum_return_pct"] = df["trade_return_pct"].cumsum()
+
+    # rolling metrics
+    r_acc: List[Optional[float]] = []
+    r_rmse: List[Optional[float]] = []
+    for i in range(len(df)):
+        if i + 1 < window:
+            r_acc.append(None)
+            r_rmse.append(None)
+        else:
+            sl = df.iloc[i + 1 - window: i + 1]
+            r_acc.append(round(100.0 * sl["hit"].mean(), 4))
+            r_rmse.append(round(np.sqrt((sl["error"] ** 2).mean()), 4))
+
+    # naive: predict prev_close
+    naive_err = df["prev_close"] - df["actual"]
+    naive_mae = float(np.abs(naive_err).mean())
+    naive_rmse = float(np.sqrt((naive_err ** 2).mean()))
+
+    # single Accuracy% for the range
+    mape_mean = float(df["mape_pct"].mean())
+    summary = {
+        "count": int(len(df)),
+        "MAE": round(float(df["abs_error"].mean()), 4),
+        "RMSE": round(float(np.sqrt((df["error"] ** 2).mean())), 4),
+        "MAPE_pct": round(mape_mean, 4),
+        "Avg_Accuracy_pct": round(100.0 - mape_mean, 4),  # <-- single indicator
+        "Directional_Accuracy_pct": round(100.0 * float(df["hit"].mean()), 2),
+        "Naive_MAE": round(naive_mae, 4),
+        "Naive_RMSE": round(naive_rmse, 4),
+        "Window": int(window),
+    }
+
+    series = BacktestSeries(
+        dates=df["date"].tolist(),
+        cum_pl_points=df["cum_pl_points"].tolist(),
+        cum_return_pct=df["cum_return_pct"].tolist(),
+        rolling_directional_accuracy_pct=r_acc,
+        rolling_rmse=r_rmse,
+    )
+
+    return BacktestResponse(
+        success=True,
+        summary=summary,
+        series=series,
+        table=df.to_dict(orient="records"),
+    )
+# --- add at top with other imports ---
+from fastapi.responses import StreamingResponse, JSONResponse
+from io import StringIO
+
+# try to use Supabase if configured
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+_supabase = None
+try:
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        from supabase import create_client, Client
+        _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        print("[DB] backtest router: Supabase client ready")
+except Exception as e:
+    print(f"[DB] backtest router: Supabase client not available: {e}")
+
+# --- helper to compute the same range result (reused by export/save) ---
+def _compute_range(start: date, end: date, lookback: int, window: int):
+    # this calls your existing backtest_range logic but returns (summary, df, series)
+    model = _load_model()
+    scaler = _load_scaler()
+
+    raw = _dl_ohlc(DEFAULT_TICKER, start, end)
+    end = min(end, raw.index.max().date())
+    mask = (raw.index.date >= start) & (raw.index.date <= end)
+    tdates = list(raw.index[mask])
+    rows = []
+    for t in tdates:
+        idx = raw.index.get_indexer([t])[0]
+        if idx < lookback:
+            continue
+        win = raw.iloc[idx - lookback: idx]
+        prev_close = float(win["Close"].iloc[-1])
+        actual = float(raw.loc[t, "Close"])
+        try:
+            pred = _predict_window(model, scaler, win[FEATURES])
+        except Exception:
+            continue
+
+        error = pred - actual
+        abs_err = abs(error)
+        mape = (abs_err / abs(actual) * 100.0) if actual != 0 else 0.0
+        acc = 100.0 - mape
+        hit = (_direction(prev_close, actual) == _direction(prev_close, pred))
+        trade_pts = _direction(prev_close, pred) * (actual - prev_close)
+        trade_ret = (trade_pts / prev_close) * 100.0 if prev_close != 0 else 0.0
+
+        rows.append({
+            "date": t.strftime("%Y-%m-%d"),
+            "actual": round(actual, 4),
+            "pred": round(float(pred), 4),
+            "prev_close": round(prev_close, 4),
+            "error": round(error, 4),
+            "abs_error": round(abs_err, 4),
+            "mape_pct": round(mape, 4),
+            "accuracy_pct": round(acc, 4),
+            "direction_pred": "UP" if pred >= prev_close else "DOWN",
+            "hit": bool(hit),
+            "trade_points": round(trade_pts, 4),
+            "trade_return_pct": round(trade_ret, 4),
+        })
+
+    if not rows:
+        raise HTTPException(400, "Not enough history for selected range.")
+
+    df = pd.DataFrame(rows)
+    df["cum_pl_points"] = df["trade_points"].cumsum()
+    df["cum_return_pct"] = df["trade_return_pct"].cumsum()
+
+    # rolling
+    r_acc, r_rmse = [], []
+    for i in range(len(df)):
+        if i + 1 < window:
+            r_acc.append(None); r_rmse.append(None)
+        else:
+            sl = df.iloc[i + 1 - window: i + 1]
+            r_acc.append(round(100.0 * sl["hit"].mean(), 4))
+            r_rmse.append(round(np.sqrt((sl["error"] ** 2).mean()), 4))
+
+    # naive
+    naive_err = df["prev_close"] - df["actual"]
+    naive_mae = float(np.abs(naive_err).mean())
+    naive_rmse = float(np.sqrt((naive_err ** 2).mean()))
+
+    mape_mean = float(df["mape_pct"].mean())
+    summary = {
+        "count": int(len(df)),
+        "MAE": round(float(df["abs_error"].mean()), 4),
+        "RMSE": round(float(np.sqrt((df["error"] ** 2).mean())), 4),
+        "MAPE_pct": round(mape_mean, 4),
+        "Avg_Accuracy_pct": round(100.0 - mape_mean, 4),
+        "Directional_Accuracy_pct": round(100.0 * float(df["hit"].mean()), 2),
+        "Naive_MAE": round(naive_mae, 4),
+        "Naive_RMSE": round(naive_rmse, 4),
+        "Window": int(window),
+    }
+    series = {
+        "dates": df["date"].tolist(),
+        "cum_pl_points": df["cum_pl_points"].tolist(),
+        "cum_return_pct": df["cum_return_pct"].tolist(),
+        "rolling_directional_accuracy_pct": r_acc,
+        "rolling_rmse": r_rmse,
+    }
+    return summary, df, series
+
+# --- 1) CSV Export ---
+@router.get("/export.csv")
+def export_range_csv(
+    start: date = Query(...),
+    end: date = Query(...),
+    lookback: int = Query(DEFAULT_LOOKBACK, ge=20, le=120),
+    window: int = Query(7, ge=2, le=60),
+):
+    summary, df, _ = _compute_range(start, end, lookback, window)
+    # include summary as first rows (prefixed with '#')
+    buf = StringIO()
+    for k, v in summary.items():
+        buf.write(f"# {k},{v}\n")
+    df.to_csv(buf, index=False)
+    buf.seek(0)
+    filename = f"backtest_{start}_{end}.csv"
+    return StreamingResponse(buf, media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+# --- 2) Save Run to Supabase ---
+@router.post("/save")
+def save_range_to_supabase(
+    start: date = Query(...),
+    end: date = Query(...),
+    lookback: int = Query(DEFAULT_LOOKBACK, ge=20, le=120),
+    window: int = Query(7, ge=2, le=60),
+):
+    if _supabase is None:
+        return JSONResponse(status_code=503, content={"success": False, "error": "Supabase not configured"})
+
+    summary, df, series = _compute_range(start, end, lookback, window)
+
+    # upsert into two tables: backtest_runs, backtest_rows
+    run_payload = {
+        "start_date": str(start),
+        "end_date": str(end),
+        "lookback": lookback,
+        "window": window,
+        **summary,
+        "model_path": _resolve_file(ENV_MODEL_PATH, "best_lstm_model.h5"),
+        "scaler_path": _resolve_file(ENV_SCALER_PATH, "scaler.save"),
+    }
+    run_res = _supabase.table("backtest_runs").insert(run_payload).execute()
+    run_id = run_res.data[0]["id"]
+
+    rows_payload = [
+        {
+            "backtest_id": run_id,
+            **{k: (None if pd.isna(v) else v) for k, v in rec.items()}
+        }
+        for rec in df.to_dict(orient="records")
+    ]
+    # batch insert (Supabase can handle arrays)
+    _supabase.table("backtest_rows").insert(rows_payload).execute()
+
+    return {"success": True, "run_id": run_id, "summary": summary, "series": series}
