@@ -1,26 +1,47 @@
-﻿import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
-import { createMiddlewareClient } from "@supabase/auth-helpers-nextjs";
+﻿// middleware.ts
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
+import { createMiddlewareClient } from '@supabase/auth-helpers-nextjs'
 
 export async function middleware(req: NextRequest) {
-  const res = NextResponse.next();
+  const res = NextResponse.next()
+  const supabase = createMiddlewareClient({ req, res })
 
-  const supabase = createMiddlewareClient({ req, res });
   const {
     data: { session },
-  } = await supabase.auth.getSession();
+  } = await supabase.auth.getSession()
 
-  if (!session) {
-    const redirectUrl = req.nextUrl.clone();
-    redirectUrl.pathname = "/signin";
-    redirectUrl.searchParams.set("next", req.nextUrl.pathname + req.nextUrl.search);
-    return NextResponse.redirect(redirectUrl);
+  const { pathname, search } = req.nextUrl
+  const isRoot = pathname === '/'
+  const isAuthRoute = pathname === '/signin' || pathname.startsWith('/auth/')
+
+  if (!session && !isAuthRoute) {
+    const url = req.nextUrl.clone()
+    url.pathname = '/signin'
+    if (pathname && pathname !== '/') {
+      url.searchParams.set('redirectedFrom', pathname + (search || ''))
+    }
+    return NextResponse.redirect(url)
   }
 
-  return res;
+  if (session && (isRoot || isAuthRoute)) {
+    const url = req.nextUrl.clone()
+    url.pathname = '/dashboard'
+    return NextResponse.redirect(url)
+  }
+
+  return res
 }
 
-// Only guard protected pages (never /auth/*)
 export const config = {
-  matcher: ["/dashboard/:path*", "/backtest/:path*", "/history/:path*"],
-};
+  matcher: [
+    '/',
+    '/signin',
+    '/dashboard',
+    '/history',
+    '/settings',
+    '/auth/:path*',
+    '/(protected)/(.*)',
+    '/((?!_next/static|_next/image|favicon.ico).*)',
+  ],
+}

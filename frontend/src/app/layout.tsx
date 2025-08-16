@@ -1,21 +1,22 @@
-﻿import './globals.css'
-import Providers from './providers'
-import AppTopBar from './components/AppTopBar'
-import ThemeRegistry from './ThemeRegistry'
+﻿import type { Metadata } from "next";
+// import ThemeRegistry from "@/ThemeRegistry";
+import AppThemeProvider from "@/lib/theme/ThemeProvider";
+import "./globals.css";
+import ThemeRegistry from "./ThemeRegistry";
 
-export const metadata = { title: 'FTSE100 Forecast' }
+export const metadata: Metadata = {
+  title: "ftse100 Forecast",
+  description: "FTSE-100 predictions & backtests",
+};
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <body>
         <ThemeRegistry>
-          <Providers>
-            <AppTopBar />
-            {children}
-          </Providers>
+          <AppThemeProvider>{children}</AppThemeProvider>
         </ThemeRegistry>
       </body>
     </html>
-  )
+  );
 }

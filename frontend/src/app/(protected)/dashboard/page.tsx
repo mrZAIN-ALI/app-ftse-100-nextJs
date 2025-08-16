@@ -1,11 +1,34 @@
 ﻿"use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { Container, Stack, Card, CardContent, Typography, Button, Alert, Chip, Divider, Box } from "@mui/material"
-import Grid from "@mui/material/Grid" // ✅ MUI v6 Grid2
-import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, ReferenceLine } from "recharts"
-import { getOHLC, getPredict } from "@/lib/api"
+import {
+  Container,
+  Stack,
+  Card,
+  CardContent,
+  Typography,
+  Button,
+  Alert,
+  Chip,
+  Divider,
+  Box,
+} from "@mui/material"
+import Grid from "@mui/material/Grid"
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  ResponsiveContainer,
+  ReferenceLine,
+} from "recharts"
+import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"
 import type { OhlcRow, PredictOut } from "@/lib/types"
+import { getOHLC } from "@/lib/api"
+
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000"
 
 export default function Dashboard() {
   const [rows, setRows] = useState<OhlcRow[]>([])
@@ -13,6 +36,8 @@ export default function Dashboard() {
   const [err, setErr] = useState<string>("")
   const [info, setInfo] = useState<string>("")
   const [loading, setLoading] = useState<boolean>(false)
+
+  const supabase = createClientComponentClient()
 
   const loadOHLC = async () => {
     setErr("")
@@ -26,14 +51,27 @@ export default function Dashboard() {
     }
   }
 
-  useEffect(() => { loadOHLC() }, [])
+  useEffect(() => {
+    loadOHLC()
+  }, [])
 
   const onPredict = async () => {
     setErr("")
     setInfo("")
     setLoading(true)
     try {
-      const p = await getPredict()
+      const {
+        data: { session },
+      } = await supabase.auth.getSession()
+
+      if (!session?.access_token) throw new Error("Not signed in")
+
+      const res = await fetch(`${BACKEND}/predict`, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      })
+      if (!res.ok) throw new Error(`Predict failed (HTTP ${res.status})`)
+
+      const p: PredictOut = await res.json()
       setPred(p)
       setInfo("Forecast generated and saved to history.")
     } catch (e: any) {
@@ -76,8 +114,16 @@ export default function Dashboard() {
                         <Line type="monotone" dataKey="close" dot={false} />
                         {pred && (
                           <>
-                            <ReferenceLine y={pred.last_close} stroke="#9e9e9e" strokeDasharray="4 4" />
-                            <ReferenceLine y={pred.predicted_close} stroke="#2e7d32" strokeDasharray="4 4" />
+                            <ReferenceLine
+                              y={pred.last_close}
+                              stroke="#9e9e9e"
+                              strokeDasharray="4 4"
+                            />
+                            <ReferenceLine
+                              y={pred.predicted_close}
+                              stroke="#2e7d32"
+                              strokeDasharray="4 4"
+                            />
                           </>
                         )}
                       </LineChart>
@@ -92,7 +138,7 @@ export default function Dashboard() {
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        color: "text.secondary"
+                        color: "text.secondary",
                       }}
                     >
                       No chart data yet — click “Refresh Data”.
@@ -105,21 +151,40 @@ export default function Dashboard() {
                 <Stack spacing={1.2}>
                   <Typography variant="h6">Forecast</Typography>
                   <Stack direction="row" spacing={1} alignItems="center">
-                    <Typography>Direction:</Typography>{directionChip || <Typography color="text.secondary">—</Typography>}
+                    <Typography>Direction:</Typography>
+                    {directionChip || (
+                      <Typography color="text.secondary">—</Typography>
+                    )}
                   </Stack>
-                  <Typography>Last close: {lastClose ? lastClose.toFixed(2) : "—"}</Typography>
-                  <Typography>Predicted close: {pred ? pred.predicted_close.toFixed(2) : "—"}</Typography>
+                  <Typography>
+                    Last close: {lastClose ? lastClose.toFixed(2) : "—"}
+                  </Typography>
+                  <Typography>
+                    Predicted close: {pred ? pred.predicted_close.toFixed(2) : "—"}
+                  </Typography>
                   <Typography>Signal: {pred ? pred.signal : "—"}</Typography>
-                  <Typography>Band: {pred ? `[${pred.band_lower.toFixed(2)} – ${pred.band_upper.toFixed(2)}]` : "—"}</Typography>
+                  <Typography>
+                    Band:{" "}
+                    {pred
+                      ? `[${pred.band_lower.toFixed(2)} – ${pred.band_upper.toFixed(2)}]`
+                      : "—"}
+                  </Typography>
                   <Divider sx={{ my: 1 }} />
                   <Stack direction="row" spacing={2}>
-                    <Button variant="contained" onClick={onPredict} disabled={loading}>
+                    <Button
+                      variant="contained"
+                      onClick={onPredict}
+                      disabled={loading}
+                    >
                       {loading ? "Predicting..." : "Predict"}
                     </Button>
-                    <Button variant="outlined" onClick={loadOHLC}>Refresh Data</Button>
+                    <Button variant="outlined" onClick={loadOHLC}>
+                      Refresh Data
+                    </Button>
                   </Stack>
                   <Typography variant="body2" color="text.secondary">
-                    Model: {pred?.model_version || "—"} | Scaler: {pred?.scaler_version || "—"}
+                    Model: {pred?.model_version || "—"} | Scaler:{" "}
+                    {pred?.scaler_version || "—"}
                   </Typography>
                 </Stack>
               </Grid>

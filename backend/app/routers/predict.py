@@ -1,19 +1,21 @@
 ﻿# backend/app/routers/predict.py
 import os
 from datetime import timedelta
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+import requests
 
 from ..core.yahoo import fetch_ohlc
 from ..core.model import predict_next_close
-from ..core import supa
+from ..core import supa  # provides SUPABASE_URL, SUPABASE_KEY, REST, etc.
 
-# Paths to model/scaler
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # backend/app
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "best_lstm_model.h5")
 SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.save")
 
 router = APIRouter()
+auth_scheme = HTTPBearer()
 
 class PredictOut(BaseModel):
     id: str | None = None
@@ -32,73 +34,96 @@ class PredictOut(BaseModel):
     ticker_used: str | None = None
 
 def _next_trading_day(d):
-    """Return next Mon–Fri date (no holiday calendar)."""
     nd = d + timedelta(days=1)
-    while nd.weekday() >= 5:  # 5=Sat, 6=Sun
+    while nd.weekday() >= 5:
         nd += timedelta(days=1)
     return nd
 
-@router.get("/predict", response_model=PredictOut)
-def predict():
-    # 1) Fetch FTSE 100 market data
+def _get_user_id_from_supabase(token: HTTPAuthorizationCredentials = Depends(auth_scheme)) -> str:
+    """Ask Supabase Auth to validate the token and return the user's id."""
+    if not supa.SUPABASE_URL or not supa.SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: Supabase env not set")
+
     try:
-        df = fetch_ohlc(120)  # expects a DatetimeIndex and columns: Close, High, Low, Open, Volume
+        resp = requests.get(
+            f"{supa.SUPABASE_URL}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token.credentials}",
+                "apikey": supa.SUPABASE_KEY,  # backend key is fine here
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            # Surface the real reason (expired token, etc.)
+            raise HTTPException(status_code=401, detail=f"Auth failed: HTTP {resp.status_code} - {resp.text}")
+        data = resp.json() or {}
+        user_id = data.get("id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Auth failed: user id missing")
+        return user_id
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Auth failed: {e}")
+
+@router.get("/predict", response_model=PredictOut)
+def predict(user_id: str = Depends(_get_user_id_from_supabase)):
+    # 1) Market data
+    try:
+        df = fetch_ohlc(120)
         ticker_used = "^FTSE"
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Unable to fetch FTSE data: {e}")
 
     if df is None or df.empty:
         raise HTTPException(status_code=502, detail="No market data returned.")
-
     if len(df) < 60:
         raise HTTPException(status_code=400, detail="Not enough data for prediction (need >= 60 rows).")
 
-    # 2) Prepare last 60 rows for model
+    # 2) Features
     last60 = df.tail(60)[["Close", "High", "Low", "Open", "Volume"]].values
     last_close = float(df["Close"].iloc[-1])
     window_start_dt = df.index[-60].date()
     window_end_dt = df.index[-1].date()
-    # Target = next trading day (simple Mon–Fri roll)
     prediction_for_dt = _next_trading_day(window_end_dt)
 
     window_start = window_start_dt.isoformat()
     window_end = window_end_dt.isoformat()
     prediction_for = prediction_for_dt.isoformat()
 
-    # 3) Run prediction
+    # 3) Inference
     try:
         pred_close = float(predict_next_close(last60, model_path=MODEL_PATH, scaler_path=SCALER_PATH))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
-    # 4) Calculate direction & signal (±1% band around last_close)
+    # 4) Signal
     direction = "UP" if pred_close >= last_close else "DOWN"
-    band_pct = 1.0  # percent
+    band_pct = 1.0
     delta = last_close * (band_pct / 100.0)
     band_lower = float(last_close - delta)
     band_upper = float(last_close + delta)
-
     conf_ok = (pred_close >= band_upper) if direction == "UP" else (pred_close <= band_lower)
     signal = "LONG" if (direction == "UP" and conf_ok) else ("SHORT" if (direction == "DOWN" and conf_ok) else "NO_TRADE")
 
-    # 5) Save to Supabase ONLY if connected
+    # 5) Persist under this user_id
     rec_id, gen_at = None, None
     if supa.is_connected():
         try:
             record = supa.insert_prediction({
-                "window_start": window_start,              # date
-                "window_end": window_end,                  # date
-                "prediction_for": prediction_for,          # date
-                "last_close": float(last_close),           # numeric
-                "predicted_close": float(pred_close),      # numeric
-                "direction_pred": direction,               # 'UP'|'DOWN'
-                "band_lower": float(band_lower),           # numeric
-                "band_upper": float(band_upper),           # numeric
-                "signal": signal,                          # 'LONG'|'SHORT'|'NO_TRADE'
+                "user_id": user_id,
+                "window_start": window_start,
+                "window_end": window_end,
+                "prediction_for": prediction_for,
+                "last_close": last_close,
+                "predicted_close": pred_close,
+                "direction_pred": direction,
+                "band_lower": band_lower,
+                "band_upper": band_upper,
+                "signal": signal,
                 "model_version": "lstm_h5_v1",
                 "scaler_version": "minmax_v1",
                 "raw_context": {"ticker_used": ticker_used}
-                # actual_close, direction_hit, abs_error, pct_error remain NULL until reconcile
             })
             rec_id = record.get("id")
             gen_at = record.get("generated_at")
@@ -107,15 +132,15 @@ def predict():
     else:
         print("[INFO] Skipped Supabase save – DB not connected.")
 
-    # 6) Return final prediction object
+    # 6) Response
     return PredictOut(
         id=rec_id,
         generated_at=gen_at,
-        last_close=float(last_close),
-        predicted_close=float(pred_close),
+        last_close=last_close,
+        predicted_close=pred_close,
         direction=direction,
-        band_lower=float(band_lower),
-        band_upper=float(band_upper),
+        band_lower=band_lower,
+        band_upper=band_upper,
         signal=signal,
         window_start=window_start,
         window_end=window_end,

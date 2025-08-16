@@ -18,6 +18,7 @@ import {
   GridRenderCellParams,
   GridToolbar,
 } from '@mui/x-data-grid';
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs';
 
 type PredRow = {
   id: string;
@@ -31,7 +32,7 @@ type PredRow = {
   direction_pred?: 'UP' | 'DOWN' | null;
   direction_hit?: boolean | null;
   abs_error?: number | null;
-  pct_error?: number | null; // 0.0123 => 1.23%
+  pct_error?: number | null;
   band_lower?: number | null;
   band_upper?: number | null;
   signal?: 'LONG' | 'SHORT' | 'NO_TRADE' | null;
@@ -172,6 +173,8 @@ export default function HistoryPage() {
   const [start, setStart] = useState<string>(''); // yyyy-mm-dd
   const [end, setEnd] = useState<string>(''); // yyyy-mm-dd
 
+  const supabase = createClientComponentClient();
+
   const csvUrl = useMemo(() => {
     const u = new URL(`${BACKEND}/history`);
     u.searchParams.set('limit', String(limit));
@@ -186,17 +189,28 @@ export default function HistoryPage() {
     setErr('');
     setLoading(true);
     try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      if (!session?.access_token) throw new Error('No auth token');
+
       const url = new URL(`${BACKEND}/history`);
       url.searchParams.set('limit', String(limit));
       url.searchParams.set('offset', String(offset));
       if (start) url.searchParams.set('start', start);
       if (end) url.searchParams.set('end', end);
-      const res = await fetch(url.toString(), { cache: 'no-store' });
+
+      const res = await fetch(url.toString(), {
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       const data: ApiResponse = await res.json();
       setRows((data?.data || []).map((x, i) => ({
         ...x,
-        id: String(x.id ?? `row-${i}`), // ensure stable string id; no duplicates
+        id: String(x.id ?? `row-${i}`),
       })));
     } catch (e: any) {
       setErr(`Failed to load history: ${e.message || e}`);
@@ -204,17 +218,30 @@ export default function HistoryPage() {
     } finally {
       setLoading(false);
     }
-  }, [limit, offset, start, end]);
+  }, [limit, offset, start, end, supabase]);
 
   const onReconcile = useCallback(async () => {
     setLoading(true);
     setErr('');
     setInfo('');
     try {
-      // Prefer POST; fallback to GET if needed
-      let res = await fetch(`${BACKEND}/reconcile`, { method: 'POST' });
-      if (!res.ok) res = await fetch(`${BACKEND}/reconcile`);
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      if (!session?.access_token) throw new Error('No auth token');
+
+      let res = await fetch(`${BACKEND}/reconcile`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (!res.ok) {
+        res = await fetch(`${BACKEND}/reconcile`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        });
+      }
       if (!res.ok) throw new Error(`Reconcile failed (HTTP ${res.status})`);
+
       const data = await res.json().catch(() => ({}));
       const updated = data?.updated ?? data?.count ?? 'OK';
       setInfo(`Reconciled: ${updated}`);
@@ -224,7 +251,31 @@ export default function HistoryPage() {
     } finally {
       setLoading(false);
     }
-  }, [fetchRows]);
+  }, [fetchRows, supabase]);
+
+  const onDownloadCsv = useCallback(async () => {
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error('No auth token');
+
+      const res = await fetch(csvUrl, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (!res.ok) throw new Error(`CSV download failed (HTTP ${res.status})`);
+
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'predictions.csv';
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setErr(`CSV download failed: ${e.message || e}`);
+    }
+  }, [csvUrl, supabase]);
 
   useEffect(() => {
     fetchRows();
@@ -239,21 +290,12 @@ export default function HistoryPage() {
 
         {err && <Alert severity="error">{err}</Alert>}
         {info && <Alert severity="success">{info}</Alert>}
+        {!err && rows.length === 0 && (
+          <Alert severity="info">No predictions yet. Run a forecast to see history.</Alert>
+        )}
 
-        {/* Filters in a Paper to ensure contrast on dark backgrounds */}
-        <Paper
-          elevation={1}
-          sx={{
-            p: 2,
-            bgcolor: 'background.paper',
-            color: 'text.primary',
-          }}
-        >
-          <Stack
-            direction={{ xs: 'column', sm: 'row' }}
-            spacing={2}
-            alignItems="center"
-          >
+        <Paper elevation={1} sx={{ p: 2, bgcolor: 'background.paper', color: 'text.primary' }}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems="center">
             <TextField
               label="Start"
               type="date"
@@ -261,12 +303,7 @@ export default function HistoryPage() {
               onChange={(e) => setStart(e.target.value)}
               InputLabelProps={{ shrink: true }}
               size="small"
-              sx={{
-                minWidth: { xs: '100%', sm: 160 },
-                '& .MuiInputBase-input': { color: 'text.primary' },
-                '& .MuiInputLabel-root': { color: 'text.secondary' },
-                '& .MuiOutlinedInput-notchedOutline': { borderColor: 'divider' },
-              }}
+              sx={{ minWidth: { xs: '100%', sm: 160 } }}
             />
             <TextField
               label="End"
@@ -275,28 +312,16 @@ export default function HistoryPage() {
               onChange={(e) => setEnd(e.target.value)}
               InputLabelProps={{ shrink: true }}
               size="small"
-              sx={{
-                minWidth: { xs: '100%', sm: 160 },
-                '& .MuiInputBase-input': { color: 'text.primary' },
-                '& .MuiInputLabel-root': { color: 'text.secondary' },
-                '& .MuiOutlinedInput-notchedOutline': { borderColor: 'divider' },
-              }}
+              sx={{ minWidth: { xs: '100%', sm: 160 } }}
             />
             <TextField
               label="Limit"
               type="number"
               value={limit}
-              onChange={(e) =>
-                setLimit(Math.max(1, Math.min(500, Number(e.target.value) || 1)))
-              }
+              onChange={(e) => setLimit(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
               InputProps={{ inputProps: { min: 1, max: 500 } }}
               size="small"
-              sx={{
-                width: 120,
-                '& .MuiInputBase-input': { color: 'text.primary' },
-                '& .MuiInputLabel-root': { color: 'text.secondary' },
-                '& .MuiOutlinedInput-notchedOutline': { borderColor: 'divider' },
-              }}
+              sx={{ width: 120 }}
             />
             <TextField
               label="Offset"
@@ -305,18 +330,13 @@ export default function HistoryPage() {
               onChange={(e) => setOffset(Math.max(0, Number(e.target.value) || 0))}
               InputProps={{ inputProps: { min: 0 } }}
               size="small"
-              sx={{
-                width: 120,
-                '& .MuiInputBase-input': { color: 'text.primary' },
-                '& .MuiInputLabel-root': { color: 'text.secondary' },
-                '& .MuiOutlinedInput-notchedOutline': { borderColor: 'divider' },
-              }}
+              sx={{ width: 120 }}
             />
 
             <Button variant="contained" onClick={fetchRows} disabled={loading}>
               {loading ? 'Loading…' : 'Apply'}
             </Button>
-            <Button variant="outlined" component="a" href={csvUrl}>
+            <Button variant="outlined" onClick={onDownloadCsv}>
               Download CSV
             </Button>
             <Button variant="outlined" onClick={onReconcile} disabled={loading}>
@@ -325,15 +345,16 @@ export default function HistoryPage() {
           </Stack>
         </Paper>
 
-        {/* Grid container with explicit height so DataGrid is never 0px */}
+        {/* Scrollable wrapper; grid computes its height with autoHeight */}
         <Box
           sx={{
-            height: { xs: 520, md: 'calc(100vh - 260px)' },
-            minHeight: 520,
+            maxHeight: { xs: 520, md: 'calc(100vh - 260px)' },
+            overflow: 'auto',
             width: '100%',
           }}
         >
           <DataGrid
+            autoHeight
             rows={rows}
             columns={columns}
             loading={loading}
@@ -351,24 +372,13 @@ export default function HistoryPage() {
             }}
             pageSizeOptions={[10, 25, 50, 100]}
             sx={{
-              height: '100%',                // make grid fill the Box
-              bgcolor: 'background.paper',   // readable on dark backgrounds
+              bgcolor: 'background.paper',
               color: 'text.primary',
-              '& .MuiDataGrid-columnHeaders': {
-                bgcolor: 'background.default',
-              },
-              '& .MuiDataGrid-cell': {
-                color: 'text.primary',
-              },
-              '& .MuiDataGrid-toolbarContainer .MuiButtonBase-root': {
-                color: 'text.primary',
-              },
-              '& .MuiSvgIcon-root': {
-                color: 'text.primary',
-              },
-              '& .MuiInputBase-input': {
-                color: 'text.primary',
-              },
+              '& .MuiDataGrid-columnHeaders': { bgcolor: 'background.default' },
+              '& .MuiDataGrid-cell': { color: 'text.primary' },
+              '& .MuiDataGrid-toolbarContainer .MuiButtonBase-root': { color: 'text.primary' },
+              '& .MuiSvgIcon-root': { color: 'text.primary' },
+              '& .MuiInputBase-input': { color: 'text.primary' },
             }}
           />
         </Box>
